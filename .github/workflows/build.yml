@@ -18,7 +18,6 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           git clone --depth=1 --recursive https://github.com/theos/theos.git "$THEOS"
-          git clone --depth=1 https://github.com/theos/sdks.git "$THEOS/sdks"
 
       - name: Build package
         run: |
