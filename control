@@ -1,0 +1,9 @@
+Package: com.muggle.dimslider
+Name: DimSlider
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Map Control Center brightness slider to Reduce White Point intensity, brightness locked at 100%
+Maintainer: muggle
+Author: muggle
+Section: Tweaks
+Depends: mobilesubstrate
