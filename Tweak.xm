@@ -6,17 +6,16 @@
 // 本项目同样以 GPL-3.0 发布
 
 #import <UIKit/UIKit.h>
+#import <dlfcn.h>
 
-extern "C" {
-	void MADisplayFilterPrefSetReduceWhitePointIntensity(CGFloat intensity);
-	CGFloat MADisplayFilterPrefGetReduceWhitePointIntensity(void);
-}
-
-@interface AXSettings : NSObject
-+ (id)sharedInstance;
+// 私有类一律运行时用 NSClassFromString 拿，避免链接期依赖私有框架
+@protocol AXSettingsProtocol <NSObject>
 - (BOOL)reduceWhitePointEnabled;
 - (void)setReduceWhitePointEnabled:(BOOL)enabled;
 @end
+
+typedef void (*SetRWPIntensityFn)(CGFloat);
+typedef CGFloat (*GetRWPIntensityFn)(void);
 
 @interface SBDisplayBrightnessController : NSObject
 - (void)setBrightnessLevel:(float)level;
@@ -28,7 +27,6 @@ extern "C" {
 @end
 
 @interface CCUIContinuousSliderView : UIControl
-@property (nonatomic, assign) BOOL isBrightnessSlider;
 - (void)setValue:(float)value;
 - (void)setGlyphPackageDescription:(CCUICAPackageDescription *)desc;
 - (void)_handleValueChangeGestureRecognizer:(UIPanGestureRecognizer *)recognizer;
@@ -36,7 +34,8 @@ extern "C" {
 
 static const char *kBrightnessGlyph = "file:///System/Library/ControlCenter/Bundles/DisplayModule.bundle/Brightness.ca/";
 
-static float gSliderLevel = 1.0f;   // 0 = 最暗（白点值100%），1 = 最亮（白点值0%）
+static __weak CCUIContinuousSliderView *gSliderView = nil;
+static float gSliderLevel = 1.0f;   // 0 = 最暗（白点值 100%），1 = 最亮（白点值 0%）
 static float gPanStartLevel = 1.0f;
 static BOOL  gDidInit = NO;
 
@@ -45,28 +44,91 @@ static float Clamp01(float v)
 	return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
+static id<AXSettingsProtocol> AXSettingsInstance(void)
+{
+	static id instance = nil;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		Class cls = NSClassFromString(@"AXSettings");
+		if ([cls respondsToSelector:@selector(sharedInstance)]) {
+			instance = (id)[cls performSelector:@selector(sharedInstance)];
+		}
+	});
+	return instance;
+}
+
+static void *MediaAccessibilityHandle(void)
+{
+	static void *handle = NULL;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		handle = dlopen("/System/Library/Frameworks/MediaAccessibility.framework/MediaAccessibility", RTLD_LAZY);
+	});
+	return handle;
+}
+
+static SetRWPIntensityFn SetIntensityFn(void)
+{
+	static SetRWPIntensityFn fn = NULL;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		void *handle = MediaAccessibilityHandle();
+		if (handle) {
+			fn = (SetRWPIntensityFn)dlsym(handle, "MADisplayFilterPrefSetReduceWhitePointIntensity");
+		}
+		if (!fn) {
+			fn = (SetRWPIntensityFn)dlsym(RTLD_DEFAULT, "MADisplayFilterPrefSetReduceWhitePointIntensity");
+		}
+	});
+	return fn;
+}
+
+static GetRWPIntensityFn GetIntensityFn(void)
+{
+	static GetRWPIntensityFn fn = NULL;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		void *handle = MediaAccessibilityHandle();
+		if (handle) {
+			fn = (GetRWPIntensityFn)dlsym(handle, "MADisplayFilterPrefGetReduceWhitePointIntensity");
+		}
+		if (!fn) {
+			fn = (GetRWPIntensityFn)dlsym(RTLD_DEFAULT, "MADisplayFilterPrefGetReduceWhitePointIntensity");
+		}
+	});
+	return fn;
+}
+
 static void ApplySliderLevel(float level)
 {
 	gSliderLevel = Clamp01(level);
 
 	CGFloat intensity = (CGFloat)(1.0f - gSliderLevel);
 
-	AXSettings *settings = [AXSettings sharedInstance];
+	id<AXSettingsProtocol> settings = AXSettingsInstance();
 	if (settings && ![settings reduceWhitePointEnabled]) {
 		[settings setReduceWhitePointEnabled:YES];
 	}
-	MADisplayFilterPrefSetReduceWhitePointIntensity(intensity);
+
+	SetRWPIntensityFn setFn = SetIntensityFn();
+	if (setFn) {
+		setFn(intensity);
+	}
 
 	NSLog(@"[DimSlider] slider=%.3f intensity=%.3f", gSliderLevel, (float)intensity);
 }
 
 static void ForceFullBrightness(void)
 {
-	SBDisplayBrightnessController *controller = [%c(SBDisplayBrightnessController) new];
+	Class cls = NSClassFromString(@"SBDisplayBrightnessController");
+	if (!cls) return;
+
+	SBDisplayBrightnessController *controller = (SBDisplayBrightnessController *)[[cls alloc] init];
 	if (!controller) return;
+
 	if ([controller respondsToSelector:@selector(setBrightnessLevel:animated:)]) {
 		[controller setBrightnessLevel:1.0f animated:NO];
-	} else {
+	} else if ([controller respondsToSelector:@selector(setBrightnessLevel:)]) {
 		[controller setBrightnessLevel:1.0f];
 	}
 }
@@ -88,21 +150,29 @@ static void ForceFullBrightness(void)
 - (void)setGlyphPackageDescription:(CCUICAPackageDescription *)desc
 {
 	%orig;
-	NSString *url = [[desc packageURL] absoluteString];
-	self.isBrightnessSlider = [url isEqualToString:[NSString stringWithUTF8String:kBrightnessGlyph]];
 
-	if (self.isBrightnessSlider && !gDidInit) {
+	NSString *url = [[desc packageURL] absoluteString];
+	if (![url isEqualToString:[NSString stringWithUTF8String:kBrightnessGlyph]]) return;
+
+	gSliderView = self;
+
+	if (!gDidInit) {
 		gDidInit = YES;
-		gSliderLevel = Clamp01(1.0f - (float)MADisplayFilterPrefGetReduceWhitePointIntensity());
+
+		GetRWPIntensityFn getFn = GetIntensityFn();
+		float current = getFn ? (float)getFn() : 0.0f;
+		gSliderLevel = Clamp01(1.0f - current);
+
 		ApplySliderLevel(gSliderLevel);
 		ForceFullBrightness();
+
 		NSLog(@"[DimSlider] initialized, restored level=%.3f", gSliderLevel);
 	}
 }
 
 - (void)setValue:(float)value
 {
-	if (!self.isBrightnessSlider) return %orig;
+	if (self != gSliderView) return %orig;
 
 	if (value >= 0.0f) {
 		// 系统想同步真实亮度 → 忽略，只回写我们自己的滑块位置
@@ -114,7 +184,7 @@ static void ForceFullBrightness(void)
 
 - (void)_handleValueChangeGestureRecognizer:(UIPanGestureRecognizer *)recognizer
 {
-	if (!self.isBrightnessSlider) return %orig;
+	if (self != gSliderView) return %orig;
 
 	if ([recognizer state] == UIGestureRecognizerStateBegan) {
 		gPanStartLevel = gSliderLevel;
